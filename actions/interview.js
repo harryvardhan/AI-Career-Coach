@@ -5,37 +5,32 @@ import { auth } from "@clerk/nextjs/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-export async function generateQuiz() {
+/**
+ * Generate AI Quiz Questions
+ */
+export const generateQuiz = async (industryOverride) => {
   const { userId } = await auth();
   if (!userId) throw new Error("Unauthorized");
 
+  // Try to use the logged-in user's industry first
   const user = await db.user.findUnique({
     where: { clerkUserId: userId },
-    select: {
-      industry: true,
-      skills: true,
-    },
   });
 
-  if (!user) throw new Error("User not found");
+  const industry = industryOverride || user?.industry || "technology";
 
   const prompt = `
-    Generate 10 technical interview questions for a ${
-      user.industry
-    } professional${
-    user.skills?.length ? ` with expertise in ${user.skills.join(", ")}` : ""
-  }.
-    
-    Each question should be multiple choice with 4 options.
-    
-    Return the response in this JSON format only, no additional text:
+    Create 10 multiple-choice interview questions for the industry:
+    ${JSON.stringify(industry)}
+
+    Return ONLY valid JSON (no markdown, no extra commentary):
     {
       "questions": [
         {
           "question": "string",
-          "options": ["string", "string", "string", "string"],
+          "options": ["A", "B", "C", "D"],
           "correctAnswer": "string",
           "explanation": "string"
         }
@@ -45,20 +40,62 @@ export async function generateQuiz() {
 
   try {
     const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-    const cleanedText = text.replace(/```(?:json)?\n?/g, "").trim();
-    const quiz = JSON.parse(cleanedText);
+    const text = result.response.text().trim();
 
-    return quiz.questions;
+    // Strip code fences if model still wraps in ```json ... ```
+    const cleaned = text.replace(/```(?:json)?|```/g, "").trim();
+
+    // Quick sanity check: if it doesn't look like JSON, don't try to parse
+    if (!cleaned || (!cleaned.startsWith("{") && !cleaned.startsWith("["))) {
+      console.error(
+        "Quiz generation: model returned non-JSON:",
+        cleaned.slice(0, 200)
+      );
+      return [];
+    }
+
+    let data;
+    try {
+      data = JSON.parse(cleaned);
+    } catch (parseErr) {
+      console.error(
+        "Quiz generation: error parsing JSON:",
+        parseErr,
+        cleaned.slice(0, 200)
+      );
+      return [];
+    }
+
+    if (!data || !Array.isArray(data.questions)) {
+      console.error("Quiz generation: JSON missing 'questions' array:", data);
+      return [];
+    }
+
+    return data.questions;
   } catch (error) {
+    // Handles 503 and any other Gemini error
     console.error("Error generating quiz:", error);
-    throw new Error("Failed to generate quiz questions");
-  }
-}
 
+    if (
+      error?.message?.includes("503") ||
+      error?.message?.toLowerCase().includes("overloaded")
+    ) {
+      console.error(
+        "Gemini model is overloaded while generating quiz. Ask user to try again later."
+      );
+    }
+
+    // Always fail gracefully
+    return [];
+  }
+};
+
+/**
+ * Save Quiz Result to DB
+ */
 export async function saveQuizResult(questions, answers, score) {
   const { userId } = await auth();
+
   if (!userId) throw new Error("Unauthorized");
 
   const user = await db.user.findUnique({
@@ -67,90 +104,83 @@ export async function saveQuizResult(questions, answers, score) {
 
   if (!user) throw new Error("User not found");
 
-  const questionResults = questions.map((q, index) => ({
+  const formattedQuestions = questions.map((q, i) => ({
     question: q.question,
-    answer: q.correctAnswer,
-    userAnswer: answers[index],
-    isCorrect: q.correctAnswer === answers[index],
+    options: q.options,
+    selectedAnswer: answers[i],
+    correctAnswer: q.correctAnswer,
     explanation: q.explanation,
+    isCorrect: answers[i] === q.correctAnswer,
   }));
 
-  // Get wrong answers
-  const wrongAnswers = questionResults.filter((q) => !q.isCorrect);
+  const wrong = formattedQuestions.filter((q) => !q.isCorrect);
 
-  // Only generate improvement tips if there are wrong answers
   let improvementTip = null;
-  if (wrongAnswers.length > 0) {
-    const wrongQuestionsText = wrongAnswers
-      .map(
-        (q) =>
-          `Question: "${q.question}"\nCorrect Answer: "${q.answer}"\nUser Answer: "${q.userAnswer}"`
-      )
-      .join("\n\n");
 
-    const improvementPrompt = `
-      The user got the following ${user.industry} technical interview questions wrong:
+  if (wrong.length > 0) {
+    const mistakes = wrong.map((q) => `Q: ${q.question}`).join("\n");
 
-      ${wrongQuestionsText}
-
-      Based on these mistakes, provide a concise, specific improvement tip.
-      Focus on the knowledge gaps revealed by these wrong answers.
-      Keep the response under 2 sentences and make it encouraging.
-      Don't explicitly mention the mistakes, instead focus on what to learn/practice.
+    const tipPrompt = `
+      A user made mistakes on these interview topics:
+      ${mistakes}
+      Provide a short encouraging improvement tip (max 2 sentences).
     `;
 
     try {
-      const tipResult = await model.generateContent(improvementPrompt);
-
+      const tipResult = await model.generateContent(tipPrompt);
       improvementTip = tipResult.response.text().trim();
-      console.log(improvementTip);
-    } catch (error) {
-      console.error("Error generating improvement tip:", error);
-      // Continue without improvement tip if generation fails
+    } catch {
+      improvementTip = null;
     }
   }
 
   try {
-    const assessment = await db.assessment.create({
+    return await db.assessment.create({
       data: {
         userId: user.id,
         quizScore: score,
-        questions: questionResults,
-        category: "Technical",
+        category: user.industry || "General",
+        questions: formattedQuestions,
         improvementTip,
       },
     });
-
-    return assessment;
   } catch (error) {
-    console.error("Error saving quiz result:", error);
-    throw new Error("Failed to save quiz result");
+    console.error(
+      "Error saving quiz result FULL:",
+      JSON.stringify(error, null, 2)
+    );
+    throw error; // keep Prisma details
   }
 }
 
+/**
+ * Fetch Saved Quiz Results
+ */
 export async function getAssessments() {
   const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+
+  // Not logged in → no assessments
+  if (!userId) {
+    return [];
+  }
 
   const user = await db.user.findUnique({
     where: { clerkUserId: userId },
   });
 
-  if (!user) throw new Error("User not found");
+  // User row doesn’t exist yet → treat as “no quizzes taken”
+  if (!user) {
+    return [];
+  }
 
   try {
-    const assessments = await db.assessment.findMany({
-      where: {
-        userId: user.id,
-      },
-      orderBy: {
-        createdAt: "asc",
-      },
+    return await db.assessment.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
     });
-
-    return assessments;
   } catch (error) {
     console.error("Error fetching assessments:", error);
-    throw new Error("Failed to fetch assessments");
+    // Fail gracefully instead of crashing the page
+    return [];
   }
 }

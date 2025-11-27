@@ -6,10 +6,9 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import {
   AlertTriangle,
   Download,
-  Edit,
   Loader2,
-  Monitor,
   Save,
+  Sparkles,
 } from "lucide-react";
 import { toast } from "sonner";
 import MDEditor from "@uiw/react-md-editor";
@@ -17,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
-import { saveResume } from "@/actions/resume";
+import { saveResume, improveWithAI } from "@/actions/resume";
 import { EntryForm } from "./entry-form";
 import useFetch from "@/hooks/use-fetch";
 import { useUser } from "@clerk/nextjs";
@@ -30,6 +29,8 @@ export default function ResumeBuilder({ initialContent }) {
   const [previewContent, setPreviewContent] = useState(initialContent);
   const { user } = useUser();
   const [resumeMode, setResumeMode] = useState("preview");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isImprovingSummary, setIsImprovingSummary] = useState(false);
 
   const {
     control,
@@ -90,27 +91,64 @@ export default function ResumeBuilder({ initialContent }) {
       parts.push(`💼 [LinkedIn](${contactInfo.linkedin})`);
     if (contactInfo.twitter) parts.push(`🐦 [Twitter](${contactInfo.twitter})`);
 
+    const fullName = user?.fullName || "Your Name";
+
     return parts.length > 0
-      ? `## <div align="center">${user.fullName}</div>
-        \n\n<div align="center">\n\n${parts.join(" | ")}\n\n</div>`
+      ? `## <div align="center">${fullName}</div>
+
+<div align="center">
+
+${parts.join(" | ")}
+
+</div>`
       : "";
   };
 
+  // --- NEW: cleaner professional summary block
+  const getSummaryMarkdown = () => {
+    const { summary } = formValues;
+    if (!summary || !summary.trim()) return "";
+    return ["## Professional Summary", "", summary.trim()].join("\n");
+  };
+
+  // --- NEW: skills as bullet list
+  const getSkillsMarkdown = () => {
+    const { skills } = formValues;
+    if (!skills || !skills.trim()) return "";
+
+    const raw = skills
+      .split(/[,;\n]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (!raw.length) return "";
+
+    const bulletList = raw.map((s) => `- ${s}`).join("\n");
+
+    return ["## Skills", "", bulletList].join("\n");
+  };
+
+  // --- UPDATED: full resume template
   const getCombinedContent = () => {
-    const { summary, skills, experience, education, projects } = formValues;
+    const { experience, education, projects } = formValues;
+
     return [
       getContactMarkdown(),
-      summary && `## Professional Summary\n\n${summary}`,
-      skills && `## Skills\n\n${skills}`,
+      "---",
+      getSummaryMarkdown(),
+      "",
+      getSkillsMarkdown(),
+      "",
       entriesToMarkdown(experience, "Work Experience"),
+      "",
       entriesToMarkdown(education, "Education"),
+      "",
       entriesToMarkdown(projects, "Projects"),
     ]
       .filter(Boolean)
-      .join("\n\n");
+      .join("\n\n")
+      .trim();
   };
-
-  const [isGenerating, setIsGenerating] = useState(false);
 
   const generatePDF = async () => {
     setIsGenerating(true);
@@ -132,11 +170,11 @@ export default function ResumeBuilder({ initialContent }) {
     }
   };
 
-  const onSubmit = async (data) => {
+  const onSubmit = async () => {
     try {
       const formattedContent = previewContent
-        .replace(/\n/g, "\n") // Normalize newlines
-        .replace(/\n\s*\n/g, "\n\n") // Normalize multiple newlines to double newlines
+        .replace(/\n/g, "\n")
+        .replace(/\n\s*\n/g, "\n\n")
         .trim();
 
       console.log(previewContent, formattedContent);
@@ -145,6 +183,30 @@ export default function ResumeBuilder({ initialContent }) {
       console.error("Save error:", error);
     }
   };
+
+  // AI improvement for Professional Summary
+  async function handleImproveSummary(currentSummary, onChange) {
+    const text = (currentSummary || "").trim();
+    if (!text) {
+      toast.error("Please write a basic summary first.");
+      return;
+    }
+
+    setIsImprovingSummary(true);
+    try {
+      const improved = await improveWithAI({
+        current: text,
+        type: "professional summary",
+      });
+      onChange(improved);
+      toast.success("Summary improved with AI ✨");
+    } catch (error) {
+      console.error("Improve summary error:", error);
+      toast.error("Failed to improve summary. Try again.");
+    } finally {
+      setIsImprovingSummary(false);
+    }
+  }
 
   return (
     <div data-color-mode="light" className="space-y-4">
@@ -204,7 +266,6 @@ export default function ResumeBuilder({ initialContent }) {
                     {...register("contactInfo.email")}
                     type="email"
                     placeholder="your@email.com"
-                    error={errors.contactInfo?.email}
                   />
                   {errors.contactInfo?.email && (
                     <p className="text-sm text-red-500">
@@ -263,12 +324,37 @@ export default function ResumeBuilder({ initialContent }) {
                 name="summary"
                 control={control}
                 render={({ field }) => (
-                  <Textarea
-                    {...field}
-                    className="h-32"
-                    placeholder="Write a compelling professional summary..."
-                    error={errors.summary}
-                  />
+                  <div className="space-y-2">
+                    <Textarea
+                      {...field}
+                      className="h-32"
+                      placeholder="Write a compelling professional summary..."
+                    />
+                    <div className="flex justify-end">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() =>
+                          handleImproveSummary(field.value, field.onChange)
+                        }
+                        disabled={isImprovingSummary}
+                        className="flex items-center gap-1"
+                      >
+                        {isImprovingSummary ? (
+                          <>
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                            Improving...
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="h-3 w-3" />
+                            Improve with AI
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  </div>
                 )}
               />
               {errors.summary && (
@@ -286,14 +372,10 @@ export default function ResumeBuilder({ initialContent }) {
                   <Textarea
                     {...field}
                     className="h-32"
-                    placeholder="List your key skills..."
-                    error={errors.skills}
+                    placeholder="List your key skills (comma, ; or new line separated)..."
                   />
                 )}
               />
-              {errors.skills && (
-                <p className="text-sm text-red-500">{errors.skills.message}</p>
-              )}
             </div>
 
             {/* Experience */}
@@ -362,34 +444,11 @@ export default function ResumeBuilder({ initialContent }) {
         </TabsContent>
 
         <TabsContent value="preview">
-          {activeTab === "preview" && (
-            <Button
-              variant="link"
-              type="button"
-              className="mb-2"
-              onClick={() =>
-                setResumeMode(resumeMode === "preview" ? "edit" : "preview")
-              }
-            >
-              {resumeMode === "preview" ? (
-                <>
-                  <Edit className="h-4 w-4" />
-                  Edit Resume
-                </>
-              ) : (
-                <>
-                  <Monitor className="h-4 w-4" />
-                  Show Preview
-                </>
-              )}
-            </Button>
-          )}
-
           {activeTab === "preview" && resumeMode !== "preview" && (
             <div className="flex p-3 gap-2 items-center border-2 border-yellow-600 text-yellow-600 rounded mb-2">
               <AlertTriangle className="h-5 w-5" />
               <span className="text-sm">
-                You will lose editied markdown if you update the form data.
+                You will lose edited markdown if you update the form data.
               </span>
             </div>
           )}
@@ -401,15 +460,24 @@ export default function ResumeBuilder({ initialContent }) {
               preview={resumeMode}
             />
           </div>
+
+          {/* Improved PDF layout */}
           <div className="hidden">
-            <div id="resume-pdf">
-              <MDEditor.Markdown
-                source={previewContent}
-                style={{
-                  background: "white",
-                  color: "black",
-                }}
-              />
+            <div
+              id="resume-pdf"
+              style={{
+                background: "white",
+                color: "black",
+                fontFamily:
+                  "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+                fontSize: "12px",
+                lineHeight: 1.5,
+                padding: "20mm",
+                maxWidth: "210mm",
+                margin: "0 auto",
+              }}
+            >
+              <MDEditor.Markdown source={previewContent} />
             </div>
           </div>
         </TabsContent>
